@@ -11,6 +11,7 @@ ends. Turns follow one rule, so mixed traffic cannot starve or thrash:
 from __future__ import annotations
 
 import collections
+import os
 import threading
 import time
 
@@ -59,6 +60,10 @@ class Router:
             for svc in self.services:
                 if name in svc.served_names():
                     return svc
+        # Local patch (aorus): with one model configured and BASALT_ANY_MODEL=1, answer any model
+        # name, as Strata and llama-server do, so clients keep their own model ids.
+        if len(self.services) == 1 and os.environ.get("BASALT_ANY_MODEL") == "1":
+            return self.services[0]
         return None
 
     def shown(self):
