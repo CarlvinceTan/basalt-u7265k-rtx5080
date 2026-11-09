@@ -5,6 +5,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
+#include "basalt/kernels/cpu/q5_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
@@ -22,14 +23,39 @@ namespace {
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
 // The gate/up rows through ggml's single-token dot; LIMITED applies the SwiGLU limit (gate capped, up clamped).
+// Software prefetch for the rows the pool streams through ggml's dot (and kq_avx2's rows): the experts come from
+// DRAM, and the L2 streamer stops at every 4 KB page, so each row asks for the bytes `pf_ahead()` past itself, as the
+// i-quant rows do (iq_avx2_rows.inc).  Only hints: the dots read the same bytes either way.  Opt-in: BASALT_PF=1 (2048
+// bytes ahead) or BASALT_PF_AHEAD=N.  On a 265K with DDR5-6000 the pool is at the DRAM limit and it measured +0.5%.
+inline int pf_ahead() {
+    static const int a = [] {
+        const char* on = std::getenv("BASALT_PF");
+        const char* e = std::getenv("BASALT_PF_AHEAD");
+        if (e) return std::atoi(e);
+        return on && on[0] == '1' ? 2048 : 0;
+    }();
+    return a;
+}
+// the `n` bytes `ahead` past p, clipped at `end` (the expert's last byte + 1)
+inline void pf_span(const uint8_t* p, size_t n, int ahead, const uint8_t* end) {
+    if (ahead <= 0) return;
+    const uint8_t* a = p + ahead;
+    const uint8_t* b = a + n < end ? a + n : end;
+    for (; a < b; a += 64) __builtin_prefetch(a, 0, 3);
+}
+
 template<bool LIMITED>
 void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
                   int r1, float sg, float su) {
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot, dot_u = traits(f.up_type)->vec_dot;
     const int n = (int) f.n_embd;
+    const int ahead = pf_ahead();
+    const uint8_t* const up_end = blob + f.up_off + (size_t) r1 * f.up_row;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.up_row;
+        pf_span(gr, f.gu_row, ahead, blob + (size_t) r1 * f.gu_row);
+        pf_span(ur, f.up_row, ahead, up_end);
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
@@ -152,6 +178,22 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+// The multi-token K-quant rows (kq_avx2.cpp: Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down) give ggml-cpu's bits for any
+// token count, but lose to ggml's single-token dot below a few tokens, and most of a decode window's expert groups
+// hold one or two (kq_vnni_test --bench on a Core Ultra 7 265K, P- and E-cores).  Taken from the counts where they
+// win; BASALT_KQ256=0 keeps ggml's dot for every count (an A/B switch: the same bits either way).
+static bool kq_rows_pay(int type, int nt) {
+    static const bool on = [] { const char* e = std::getenv("BASALT_KQ256"); return !(e && e[0] == '0'); }();
+    if (!on) return false;
+    switch (type) {
+        case 12: return nt >= 3;   // Q4_K gate/up
+        case 13: return nt >= 2;   // Q5_K gate/up
+        case 7: return nt >= 2;    // Q5_1 down
+        case 8: return nt >= 3;    // Q8_0 down (the VNNI-INT8 ggml dot ties at two)
+        default: return false;
+    }
+}
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
@@ -186,6 +228,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
+    }
+    if (!cpu512 && avx2 && f.swiglu_limit <= 0.f && !f.tail && f.up_type == f.gu_type && kq_rows_pay(f.gu_type, nt)) {
+        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
     }
     const int n = (int) f.n_embd;
     float sg = 1.f, su = 1.f;
@@ -225,6 +271,14 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
+    if (cpu_avxvnni_ok() && f.d_type == GGML_TYPE_Q5_0 && !f.tail && q50_vnni_fits((int) f.n_ff) && q50_vnni_enabled()) {
+        q50_down_rows_vnni(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (!cpu_avx512_ok() && cpu_avx2_ok() && !f.tail && kq_rows_pay(f.d_type, nt)) {
+        kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     float sd = 1.f;
@@ -246,8 +300,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
+    const int ahead = pf_ahead();
+    const uint8_t* const d_end = blob + f.down_off + (size_t) r1 * f.d_row;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        pf_span(dr, f.d_row, ahead, d_end);
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);

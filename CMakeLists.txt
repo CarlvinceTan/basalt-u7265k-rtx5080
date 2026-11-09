@@ -1266,8 +1266,9 @@ set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSIT
 # The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
 # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
 set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
+set(_ggml_dots_avxvnni_flags ${_isa_avxvnni_flags} ${_isa_avxvnniint8_flags})
 set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
-foreach(_isa avx2 avx512)
+foreach(_isa avx2 avxvnni avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
@@ -1280,9 +1281,10 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/nvfp4_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
+                                         src/kernels/cpu/q5_avx2_vnni.cpp
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
-                                         $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
+                                         $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avxvnni> $<TARGET_OBJECTS:ggml_dots_avx512>)
 # the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
 # intrinsics without a switch.
 if(MSVC)
@@ -1295,10 +1297,11 @@ set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the same rows with the AVX-VNNI instructions and BMI2 (pdep for the grid indices), called only behind cpu_avxvnni_ok()
 set_source_files_properties(src/kernels/cpu/iq_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
+set_source_files_properties(src/kernels/cpu/q5_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the same rows with AVX-VNNI-INT8 (`vpdpbssd`), called only behind cpu_avxvnni_int8_ok()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnniint8_flags}")
-set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags};${_isa_avxvnniint8_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
 # MSVC gives the scalar F16C conversions no working code: its headers declare them nowhere, and with
@@ -1529,6 +1532,15 @@ if(BUILD_TESTING)
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
+  add_executable(q50_vnni_test tests/kernels/cpu/q50_vnni_test.cpp)
+  target_link_libraries(q50_vnni_test PRIVATE kernels_cpu platform)
+  set_source_files_properties(tests/kernels/cpu/q50_vnni_test.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  basalt_cpu_test(NAME q50_vnni_test COMMAND q50_vnni_test)
+  # the forks AVX-VNNI dot table and K-quant multi-token rows against upstreams AVX2 path, bit for bit
+  add_executable(kq_vnni_test tests/kernels/cpu/kq_vnni_test.cpp)
+  target_link_libraries(kq_vnni_test PRIVATE kernels_cpu platform)
+  set_source_files_properties(tests/kernels/cpu/kq_vnni_test.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  basalt_cpu_test(NAME kq_vnni_test COMMAND kq_vnni_test)
   # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
   add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
   target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
