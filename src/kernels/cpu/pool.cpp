@@ -10,6 +10,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include "basalt/log.hpp"
 
 namespace basalt::kernels::cpu {
@@ -123,6 +127,26 @@ void ExpertPool::publish() {
 
 void ExpertPool::worker(int id) {
     uint32_t seen = 0;
+#if defined(__linux__)
+    // The fork: BASALT_PIN=1 pins worker i to topo_.worker_cores[i] (the P-cores but the host's, then the E-cores).
+    // Upstream computes that list and only sizes the pool by it, so the workers float over every core with the host,
+    // the adaptive copies, the n-gram reads and the driver's threads.  With fewer workers than listed cores the last
+    // cores stay free for those.
+    static const bool pin = [] { const char* e = std::getenv("BASALT_PIN"); return e && e[0] == '1'; }();
+    if (pin && id < (int) topo_.worker_cores.size()) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(topo_.worker_cores[(size_t) id], &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof set, &set) != 0)
+            basalt::log::warn("basalt pool", "worker %d: could not pin to CPU %d", id, topo_.worker_cores[(size_t) id]);
+    }
+#endif
+    // The park spins this long before it yields its core (BASALT_SPIN_US, default kSpinBeforeYield = 50 us).  A decode
+    // layer's GPU part keeps the workers parked ~100+ us, so with the default every worker yields once a layer.
+    static const std::chrono::microseconds spin_yield = [] {
+        const char* e = std::getenv("BASALT_SPIN_US");
+        return e ? std::chrono::microseconds(std::atoi(e)) : std::chrono::microseconds(kSpinBeforeYield);
+    }();
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction: a
     // `set_active_workers` before the first batch waits for `parked_ == n_` and would otherwise never return.
     parked_.fetch_add(1, std::memory_order_acq_rel);
@@ -146,7 +170,7 @@ void ExpertPool::worker(int id) {
             else _mm_pause();
             if ((++spins & 63u) != 0) continue;
             const auto waited = std::chrono::steady_clock::now() - parked_at;
-            yielding = waited >= kSpinBeforeYield;
+            yielding = waited >= spin_yield;
             if (waited < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
