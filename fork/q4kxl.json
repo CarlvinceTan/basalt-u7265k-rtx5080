@@ -15,7 +15,10 @@
     "pool-workers": 18,
     "prefill-cpu-share": 0.5,
     "vram-reserve-mib": 300,
-    "expert-profile-save": "/home/carl/.cache/basalt/q4kxl-fork.prof"
+    "expert-profile-save": "/home/carl/.cache/basalt/q4kxl-fork.prof",
+    "conversation-cache-mib": 4096,
+    "conversation-cache-min-tokens": 8192,
+    "conversation-cache-disk-mib": 16384
   },
   "server": {
     "host": "127.0.0.1",
