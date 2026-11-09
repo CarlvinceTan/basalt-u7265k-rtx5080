@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "model": "/home/carl/models/basalt-ud/Qwen3.8-FN-UD-Q4_K_XL-fork.basalt",
+      "gpu": "0",
+      "kv": "int8",
+      "max-context": 262144,
+      "vision": "dynamic"
+    }
+  ],
+  "engine": {
+    "resident-experts": true,
+    "pool-affinity": "all",
+    "pool-workers": 18,
+    "prefill-cpu-share": 0.5,
+    "vram-reserve-mib": 300,
+    "expert-profile-save": "/home/carl/.cache/basalt/q4kxl-fork.prof"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 11001
+  }
+}
