@@ -13,6 +13,10 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -976,6 +980,10 @@ bool FileExpertSource::pin_cache_complement(
         }
         if (arena == nullptr) {
             arena = basalt::platform::alloc_aligned((size_t) bytes, kArenaAlign);
+#if defined(__linux__)
+            if (arena != nullptr && std::getenv("BASALT_THP") && std::getenv("BASALT_THP")[0] == '1')
+                madvise(arena, (size_t) bytes, MADV_HUGEPAGE);   // as alloc_ram's arena (ram_load.cpp)
+#endif
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;

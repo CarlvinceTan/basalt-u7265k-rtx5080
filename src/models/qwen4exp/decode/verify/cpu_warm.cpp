@@ -8,6 +8,7 @@
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -79,10 +80,24 @@ void warm_select(CpuWarm& c) {
             score[e] += w[j] / sum;
         }
     }
-    int best = -1;
-    for (int e = 0; e < NE; ++e)
-        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+    static const int want = [] {
+        const char* e = std::getenv("BASALT_WARM_N");
+        const int n = e ? std::atoi(e) : 1;
+        return std::max(1, std::min(n, (int) CpuWarm::kWarmMax));
+    }();
+    int pick[CpuWarm::kWarmMax];
+    int np = 0;
+    for (int e = 0; e < NE; ++e) {   // the `want` best scores, best first
+        if (score[e] <= 0.0f) continue;
+        if (np == want && score[e] <= score[pick[want - 1]]) continue;
+        int j = np < want ? np++ : want - 1;
+        while (j > 0 && score[pick[j - 1]] < score[e]) { pick[j] = pick[j - 1]; --j; }
+        pick[j] = e;
+    }
+    c.n_blobs = 0;
+    for (int i = 0; i < np; ++i)
+        if (const uint8_t* b = c.src->resident_blob(c.layer, pick[i])) c.blobs[c.n_blobs++] = b;
+    c.blob = c.n_blobs > 0 ? c.blobs[0] : nullptr;
 }
 
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
@@ -100,14 +115,18 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
     // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
     // rows, so a read the doorbell cuts short has warmed the start of the computation
     if (c.blob == nullptr) return;
+    const size_t c_bytes = c.bytes_l.empty() ? c.bytes : c.bytes_l[(size_t) c.layer];
+    const size_t c_down = c.down_l.empty() ? c.down_off : c.down_l[(size_t) c.layer];
     uint64_t x = 0;
+    for (int bi = 0; bi < c.n_blobs && !stop.load(std::memory_order_relaxed); ++bi)   // likeliest first
     for (int part = 0; part < 2; ++part) {
-        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
+        const uint8_t* const blob = c.blobs[bi];
+        const size_t r0 = part == 0 ? 0 : c_down, r1 = part == 0 ? c_down : c_bytes;
         const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
         const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
         for (size_t o = b0; o < b1; o += 4096) {
             if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
-            const uint8_t* p = c.blob + o;
+            const uint8_t* p = blob + o;
             const size_t n = std::min<size_t>(4096, b1 - o);
             for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
         }

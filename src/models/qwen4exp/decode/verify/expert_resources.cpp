@@ -19,6 +19,7 @@
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -100,10 +101,14 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
-                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
-                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
-                          });
+    // The fork reads each layer's own blob size (CpuWarm::bytes_l), so packs whose layers' experts differ in size
+    // (UD-Q4_K_XL) can have the warm-up too.  Opt-in, BASALT_WARM=1: on a 265K with DDR5-6000 the pool already reads at
+    // the DRAM limit, and the warm-up's 2-3% faster reads came with as much host time (BASALT_WARM_N=1 and 3).
+    static const bool warm_env = [] { const char* e = std::getenv("BASALT_WARM"); return e && e[0] == '1'; }();
+    const bool uniform = std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
+        return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
+    });
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 && (uniform || warm_env);
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
@@ -191,6 +196,10 @@ bool Verifier::dm_init(std::string& err) {
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
         w->bytes = lay.fmt[0].bytes;
         w->down_off = lay.fmt[0].down_off;
+        for (const auto& f : lay.fmt) {
+            w->bytes_l.push_back(f.bytes);
+            w->down_l.push_back(f.down_off);
+        }
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }

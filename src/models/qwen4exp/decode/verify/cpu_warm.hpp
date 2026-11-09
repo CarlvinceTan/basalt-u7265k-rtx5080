@@ -22,6 +22,7 @@ struct CpuWarm {
     std::vector<float> rs;    ///< [n_layers][n_expert][n_embd / 32]
     int n_expert = 0, n_embd = 0, k = 0;
     size_t bytes = 0, down_off = 0;   ///< a blob's bytes, where its down rows start
+    std::vector<size_t> bytes_l, down_l;   ///< the same per layer (the fork: packs whose layers' blobs differ)
     ExpertSource* src = nullptr;
     // the job in flight
     int layer = 0, n_tok = 0;
@@ -30,7 +31,12 @@ struct CpuWarm {
     std::vector<float> logits;                        ///< [kVerifyMaxT][n_expert]
     alignas(64) std::atomic<int> arrive{0};
     alignas(64) std::atomic<int> ready{0};
-    const uint8_t* blob = nullptr;                    ///< the expert to read, or null
+    const uint8_t* blob = nullptr;                    ///< the expert to read, or null (the likeliest of `blobs`)
+    /// The fork's warm-up reads up to kWarmMax of the likeliest experts, in rank order (BASALT_WARM_N, default 1: the
+    /// upstream read).  The gap the GPU leaves between doorbells holds about three blobs at DDR5 speed on a 265K.
+    static constexpr int kWarmMax = 6;
+    const uint8_t* blobs[kWarmMax] = {};
+    int n_blobs = 0;
     std::atomic<uint64_t> sink{0};
 };
 

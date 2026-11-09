@@ -8,9 +8,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace basalt::core {
 
@@ -283,7 +288,17 @@ uint64_t ram_padded(uint64_t bytes) {
 }
 
 uint8_t* alloc_ram(uint64_t bytes) {
-    return (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
+    uint8_t* p = (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
+#if defined(__linux__)
+    // Transparent huge pages for the arena, asked before the reads fault it in (THP is "madvise" on most distros, and
+    // posix_memalign's mapping is not advised).  The CPU expert pool streams whole experts from random places in tens
+    // of GiB: with 4 KB pages every 3 MB expert costs ~750 TLB misses, and the arena's 4 KB page tables (~2 MiB per
+    // GiB) are far past the caches, so the walks go to DRAM beside the expert reads.  Opt-in, BASALT_THP=1: on a 265K with
+    // DDR5-6000 the pool streamed no faster with them, and the load took up to four times longer (compaction).
+    static const bool thp = [] { const char* e = std::getenv("BASALT_THP"); return e && e[0] == '1'; }();
+    if (p != nullptr && thp) madvise(p, (size_t) ram_padded(bytes), MADV_HUGEPAGE);
+#endif
+    return p;
 }
 
 std::vector<RamPin> pin_ram_spans(const std::vector<uint8_t*>& spans, const std::vector<uint64_t>& bytes, bool mapped) {
