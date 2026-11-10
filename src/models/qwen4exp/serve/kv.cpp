@@ -188,8 +188,10 @@ bool QfnRuntime::peer_take(const std::vector<int32_t>& off, std::string& e) {
     peer.apply_pending(true);
     const std::vector<int32_t>& pres = peer.residency();
     // one pool when every layer's blobs are one size (a slot takes any layer's expert), else one per layer
-    const int64_t pools = xq_across ? 1 : g.n_layers;
-    auto pool_of = [&](size_t i) { return xq_across ? (size_t) 0 : i / (size_t) g.n_expert; };
+    const int64_t pools = xq_across ? xq_classes : g.n_layers;
+    auto pool_of = [&](size_t i) {
+        return xq_across ? (size_t) xq_class[i / (size_t) g.n_expert] : i / (size_t) g.n_expert;
+    };
     std::vector<std::vector<int32_t>> in((size_t) pools), on((size_t) pools);
     for (const int32_t i : off)
         if (pres[(size_t) i] < 0) in[pool_of((size_t) i)].push_back(i);

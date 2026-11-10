@@ -281,6 +281,10 @@ private:
     struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
     bool peer_excl{};
     bool xq_across{};
+    /// The fork: each layer's blob-size class.  A slot takes any expert of its own size, so the cross-layer rounds
+    /// rank once per class (one class when every layer's blobs are one size, as upstream requires).
+    std::vector<int32_t> xq_class;
+    int32_t xq_classes{1};
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
