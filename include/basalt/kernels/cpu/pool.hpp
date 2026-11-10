@@ -100,6 +100,18 @@ public:
     /// at the end of a phase, until the claim traffic and the short streams cost more than the tail they remove.
     static constexpr int kTasksPerThread = 12;
     static constexpr int kTasksPerThreadAvx2 = 8;   // the native multi-token path on AVX2
+    /// The fork, a hybrid P/E CPU without AVX-512 (Arrow Lake): its cores differ 2x in speed, so a phase's tail is
+    /// longer and finer tasks pay.  32 a thread, each task kept between kTaskBytesMin and kTaskBytesMax of weights, so
+    /// a layer with two experts is not cut into single rows and one with thirty still gets short tasks.  On a Core
+    /// Ultra 7 265K (DDR5-6000, 18 workers, 10.5 experts a layer, cold RAM; the bus reads 93 GB/s): 8 a thread
+    /// 86.0 GB/s, 12 88.4, 24-48 90.6-90.9, 96 89.0; two experts a layer: 27 KB tasks 84 GB/s, 10 KB 77, 5 KB 47;
+    /// 24 experts: 122 KB tasks 90.6, 36-72 KB 91.2.
+    static constexpr int kTasksPerThreadHybrid = 32;
+    static constexpr size_t kTaskBytesMin = (size_t) 24 << 10, kTaskBytesMax = (size_t) 48 << 10;
+    /// Row tasks a thread in the native multi-token batches: n > 0 that count with no size bounds, 0 upstream's
+    /// count, -1 the CPU's own rule (the default; BASALT_POOL_TASKS=N sets it at start).  Host thread only, between
+    /// batches.  Outputs do not depend on it: a row's value is the same in any task (pool_tasks_test).
+    void set_tasks_per_thread(int n) { tasks_ = n; }
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
     /// or the destructor raises `stop`, ends the claims and waits for every claimed job to return, so the work never
@@ -221,6 +233,7 @@ private:
     std::chrono::steady_clock::time_point pend_t0_{};
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
+    int tasks_ = -1;   // set_tasks_per_thread
     CpuTopology topo_;
 };
 

@@ -26,11 +26,12 @@ if [ $FETCH = 1 ]; then
   git rebase origin/main || { echo "rebase stopped on a conflict: resolve it, 'git rebase --continue', then run with --no-fetch"; exit 1; }
 fi
 
-cmake --build build --target basalt kq_vnni_test q50_vnni_test native_expert_parity dec_moe_parity -j "$(nproc)"
+cmake --build build --target basalt kq_vnni_test q50_vnni_test pool_tasks_test native_expert_parity dec_moe_parity -j "$(nproc)"
 
 echo "== parity"
 ./build/kq_vnni_test | tail -1
 ./build/q50_vnni_test | tail -1
+./build/pool_tasks_test | tail -1
 GPU_FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits)
 if [ "$GPU_FREE" -gt 4000 ]; then
   ./build/dec_moe_parity --kq | tail -1

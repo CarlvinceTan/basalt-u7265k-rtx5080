@@ -96,6 +96,7 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     basalt::core::diag_pool_fn().store(&diag_active_pool);
     split_multi_.resize((size_t) kMaxSplitMulti);
     fused_.reset(new FusedExpert[(size_t) kMaxSplitMulti]);
+    if (const char* e = std::getenv("BASALT_POOL_TASKS")) tasks_ = std::atoi(e);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         threads_.emplace_back([this, i] { worker(i); });
@@ -427,7 +428,9 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     mjobs_ = jobs;
     nfmt_ = &f;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
-    const int tpt = cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
+    // the fork: a hybrid CPU's own count and task-size bounds (kTasksPerThreadHybrid); set_tasks_per_thread overrides
+    const bool sized = tasks_ < 0 && topo_.is_hybrid && !cpu_avx512_ok();
+    const int tpt = tasks_ > 0 ? tasks_ : sized ? kTasksPerThreadHybrid : cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
     // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
     // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
     // The share of tasks follows the share of bytes of the two projections.
@@ -436,6 +439,14 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     fused_tail_ = threads;
     fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(tpt * threads * gu_share / nb)));
     fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(tpt * threads * (1.0 - gu_share) / nb)));
+    if (sized) {
+        auto bound = [](int parts, size_t bytes, int rows) {
+            const int lo = (int) ((bytes + kTaskBytesMax - 1) / kTaskBytesMax), hi = (std::max)(1, (int) (bytes / kTaskBytesMin));
+            return (std::min)(rows, (std::max)(1, (std::min)((std::max)(parts, lo), hi)));
+        };
+        fused_gu_parts_ = bound(fused_gu_parts_, f.down_off, (int) f.n_ff);
+        fused_d_parts_ = bound(fused_d_parts_, f.d_row * (size_t) f.n_embd, (int) f.n_embd);
+    }
     for (int e = 0; e < nb; ++e) {
         fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);

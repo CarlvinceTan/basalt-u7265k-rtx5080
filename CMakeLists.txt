@@ -1541,6 +1541,11 @@ if(BUILD_TESTING)
   target_link_libraries(kq_vnni_test PRIVATE kernels_cpu platform)
   set_source_files_properties(tests/kernels/cpu/kq_vnni_test.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
   basalt_cpu_test(NAME kq_vnni_test COMMAND kq_vnni_test)
+  # the pool's row tasks: every task count and the hybrid rule give the same bits
+  add_executable(pool_tasks_test tests/kernels/cpu/pool_tasks_test.cpp)
+  target_link_libraries(pool_tasks_test PRIVATE kernels_cpu platform)
+  set_source_files_properties(tests/kernels/cpu/pool_tasks_test.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+  basalt_cpu_test(NAME pool_tasks_test COMMAND pool_tasks_test)
   # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
   add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
   target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
