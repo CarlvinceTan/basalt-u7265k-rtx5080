@@ -126,8 +126,10 @@ Revert to the unit's own binary: `rm ~/.config/systemd/user/basalt.service.d/for
   workers are busy ~95% of the pool's phase.  Faster memory is the remaining lever: DDR5-7200/8000 (CUDIMM, Intel's
   200S Boost profile allows 8000) would raise it 20-30%.  Raising only the D2D/NGU clocks mostly lowers latency, not
   bandwidth.
-- The n-gram table is read from the SSD per token (4 KiB direct reads). Heavy writes to the same QLC drive (downloads,
-  media output) raise read latency and slow decode measurably (~2 ms per window instead of ~0.03).
+- The n-gram table is read from the SSD per token (4 KiB direct reads). Measured 2026-11-10: a healthy drive blocked a
+  decode window 0.15 ms for its rows (p50 0.37 ms a read, p99 3 ms); after a slow pack load, 4.2 ms (p50 0.40 ms, p99
+  26 ms - the tail is what costs, 8-14% of decode). Heavy writes to the same QLC drive (downloads, media output) are
+  the cause.
 - The models live on a QLC, DRAM-less NVMe (Crucial P3 Plus).  Every other load of a pack reads at about a third of the
   speed (0.6 vs 1.9 GB/s: ~190 s instead of ~60 s), not thermal, no host writes - most likely the drive's own background
   work after re-reading the same ~75 GB.  The first requests after a slow load run slower too (n-gram reads wait).  A
@@ -135,8 +137,12 @@ Revert to the unit's own binary: `rm ~/.config/systemd/user/basalt.service.d/for
   jobs.  Measured 2026-11-10 with 4 KiB direct reads of the pack: healthy, 0.21 ms a read and 1.1 ms for the 48 reads
   of one window; during a slow load the drive reads 430-650 MB/s and one small read takes 20-50 ms; it recovered about
   30 s after the load ended.  In the affected stretches a decode window waits 3-6 ms for its rows (15-20% of decode);
-  that day, with a load every few minutes, 11 of 16 loads were slow.  The second drive in the machine (a SATA 860 QVO,
-  with DRAM) answered 0.25 ms and 1.45 ms throughout, slow loads included: the n-gram table on it would be out of the
-  pack reads' way (not done; it needs the table in a file of its own).
+  that day, with a load every few minutes, 11 of 16 loads were slow.
+- The n-gram table was tried on the second drive (a SATA 860 QVO) to get it out of the pack reads' way: the table's
+  102 GB copied to a file of its own and read from there (`BASALT_PLE_FILE`, a fork change since reverted).  It lost
+  clearly - read p50 2.9 ms against the pack's 0.37 ms, a decode window blocked 3.8 ms instead of 0.15, 4K decode 78
+  against 91 tok/s.  The QVO serves the first reads of a fresh copy from its SLC cache (0.25-0.4 ms) and ~3 ms once the
+  fold moves it to QLC; standalone 4 KiB random reads of the copy made it look fast.  The table stays on the pack's
+  drive; only a TLC drive with DRAM is worth trying it on.
 - Arrow Lake reports AVX-VNNI-INT8 through CPUID even where `/proc/cpuinfo` has no flag name; Basalt's `cpu_avxvnni_int8_ok`
   reads CPUID directly.
