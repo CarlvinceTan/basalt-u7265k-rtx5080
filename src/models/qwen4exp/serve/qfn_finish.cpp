@@ -119,6 +119,12 @@ void QfnRequest::report_request(const DoneCounts& dc) {
         basalt::log::info("basalt serve", "expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
                              "%.1f MB read", (long long) req_hits, (long long) runtime_.src.ram_reads(),
                      (long long) runtime_.src.file_reads(), (double) runtime_.src.file_read_bytes() / 1e6);
+    // The fork: the n-gram table's reads, cumulative - rows asked for, row-cache hits, SSD reads with their latency,
+    // and the time the decode loop was blocked on them.  A drive that answers slowly (a DRAM-less QLC NVMe after a
+    // 75 GB pack read) costs each window milliseconds; it shows here before it shows in tok/s.
+    if (runtime_.ss.ple.table != nullptr)
+        if (const std::string io = runtime_.ss.ple.table->io_report(); !io.empty())
+            basalt::log::info("basalt serve", "%s", io.c_str());
     if (runtime_.g.n_qsa_layers() > 0 && runtime_.ss.qsa_states[runtime_.ss.qsa_primary()].kv_mode == 1) {
         // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
         // (this device's owned ordinals; a split's other stages hold theirs)
