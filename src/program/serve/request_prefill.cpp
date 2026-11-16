@@ -1,4 +1,5 @@
 // src/program/serve/request_prefill.cpp - request read_prompt operations.
+#include "prompt_parts.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -18,6 +19,7 @@ Flow Request::read_prompt() {
     req_sp.top_k = req_top_k;
     req_sp.seed = req_seed_given ? req_seed
                                  : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+    req_sp.draw_drafts = !req_seed_given;   // a given seed fixes the reply at any window (sampler.hpp)
     req_sp.min_p = req_min_p;
     req_sp.penalty_last_n = req_penalty_last_n;   // 0..kPenaltyWindowCap: request_parse refuses a wider window
     req_sp.penalty_repeat = req_penalty_repeat;
@@ -49,20 +51,29 @@ Flow Request::read_prompt() {
     // the retention policy pins (conv_cache.hpp), so the next new chat reads only what comes after it.  Only
     // for a system prompt of --prompt-cache-root tokens or more: a small one is cheaper to read again than the
     // extra part costs.
-    root_at = -1;
-    if (runtime_.o.prompt_cache > 0 && runtime_.o.turn_token >= 0 && runtime_.o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
-        for (int64_t i = 1; i < turn_at; ++i)
-            if (ids[(size_t) i] == runtime_.o.turn_token) {
-                if (i >= runtime_.o.prompt_cache_root) root_at = i;
-                break;
-            }
+    root_at = runtime_.o.prompt_cache > 0 && (read_from == 0 || resumed_from0)
+                  ? root_boundary(ids, turn_at, runtime_.o.turn_token, runtime_.o.reply_role_token, runtime_.o.prompt_cache_root)
+                  : -1;
+    // A prompt with pictures also stops right after the last picture's rows before the new turn: another question
+    // about the same pictures (a new chat, or the turn asked again) then finds them read, in a checkpoint that
+    // ends where the question begins.
+    media_at = -1;
+    if (runtime_.o.prompt_cache > 0 && !runtime_.req_imgs.empty()) {
+        auto is_pad = [&](int64_t id) { return id == runtime_.o.image_pad_id || (runtime_.o.video_pad_id >= 0 && id == runtime_.o.video_pad_id); };
+        int64_t end = runtime_.req_imgs.back().start;
+        while (end < n && is_pad(ids[(size_t) end])) ++end;
+        const int64_t last = turn_at > 0 ? turn_at : n - 1;
+        // exactly where the picture's rows end: a model that reads a picture as one block of rows can stop a read only
+        // at a picture's edge
+        if (end > std::max(resume, root_at) && end < last) media_at = end;
+    }
     limit_parts();
     at = read_from;
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
     prompt_parts_begin();
-    for (const int64_t to : {root_at, turn_at, n - 1}) {
+    for (const int64_t to : {root_at, media_at, turn_at, n - 1}) {
         if (to <= at) continue;
         const Flow flow = read_to(to);
         if (flow == Flow::quit) break;   // stopped while reading: the rest of the request runs, and ends as cancelled

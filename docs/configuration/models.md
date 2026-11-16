@@ -19,9 +19,10 @@ and starts the next.
 - `models`: each entry has a `model` (relative to the file) and an optional `alias`, the name the API reports.
 - `engine`: applies to every model that takes it. An entry's own value wins.
 - `server`: shared by the whole server: `host`, `port`, `allowed-host`, `cors-origin`, `image-url-host`, `image-dir`,
-  `image-remote-only`, `lazy`, `open`, `debug`, `request-lines`.
+  `image-remote-only`, `max-payload-mib`, `lazy`, `open`, `debug`, `request-lines`.
 - An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `slot-full-context`, `idle-sleep`,
-  `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, the reasoning settings and the sampling defaults.
+  `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, `video-max-tokens`, the reasoning settings and the sampling
+  defaults.
 - `version` is `2`. A file in the old shape (no `models`) is refused.
 - The command line wins for every model.
 

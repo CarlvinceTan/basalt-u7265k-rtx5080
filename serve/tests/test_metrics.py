@@ -30,7 +30,7 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 class Clocked(MockEngine):
     """The mock engine with a DONE line's figures, as ProcessEngine keeps them."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         n = 0
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
@@ -75,12 +75,13 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "hardware", "hardware_static", "history", "models", "swap"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
+                                 "history", "models", "swap"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
-                                          "tok_s", "prefill_tok_s_mean"})
+                                          "tok_s", "phase", "prefill_tok_s_mean"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
@@ -98,6 +99,19 @@ class Http(unittest.TestCase):
         self.assertEqual((e["expert_total"], e["spill"]["experts"]), (15360, 320))
         self.engine.info = {"expert_slots": 9}                       # an engine that reports no total
         self.assertIsNone(self.call("/metrics")[1]["engine"]["expert_total"])
+
+    def test_a_dense_model_reports_its_host_weights(self):
+        self.engine.info = {"gpu_weight_bytes": 19756849562, "host_weight_bytes": 0, "host_embedding_bytes": 2576980378, "host_vision_bytes": 900000000, "spill_experts": 0, "spill_total": 0, "spill_bytes": 0}
+        e = self.call("/metrics")[1]["engine"]
+        self.assertEqual((e["host_weight_bytes"], e["host_embedding_bytes"], e["expert_total"], e["spill"]), (0, 2576980378, 0, None))
+        js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")
+        self.assertIn("num(eng.host_weight_bytes)", js)          # the page tells a dense model by the field only it reports
+        self.assertIn("function drawWeights", js)
+        self.assertEqual(self.call("/metrics")[1]["engine"]["host_vision_bytes"], 900000000)
+        self.assertEqual(self.call("/metrics")[1]["engine"]["gpu_weight_bytes"], 19756849562)
+        self.assertIn("eng.gpu_weight_bytes", js)                # the VRAM segment of the Weights bar
+        self.assertIn('"On the GPU"', js)
+        self.assertNotIn("Vision encoder in RAM", js)
 
     def test_the_experts_card_reads_the_engine_when_there_is_no_ledger(self):
         js = (TEMPLATE.parent / "web/app.js").read_text(encoding="utf-8")

@@ -2,6 +2,7 @@
 // experts and the shared expert. The layer loop calls these; the default implementation reports what is missing.
 #pragma once
 
+#include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
 
 #include <cstdint>
@@ -51,6 +52,10 @@ public:
         err = "deepseek41: this layer ops implementation has no batched compressor";
         return false;
     }
+    /// The workspaces of attention_batch and compress_batch for chunks of up to `max_tokens`: a prompt's, opened and
+    /// released with its other workspaces so the expert tier plans for them.
+    virtual bool open_batch(int max_tokens, std::string& err) { (void) max_tokens; (void) err; return true; }
+    virtual void close_batch() {}
     /// The expert tier (VRAM slots and the pinned RAM copy), opened on first use; null when this implementation has none.
     virtual ExpertTier* expert_tier(std::string& err) { (void) err; return nullptr; }
     /// Backs the per-position state (the compressed caches) for positions below `positions`; the layer calls need it
@@ -62,14 +67,15 @@ public:
     /// A new sequence starts: gives back the cache memory a long earlier one left mapped (`ensure_positions` maps it
     /// again as positions arrive).
     virtual void trim_positions() {}
-    /// Copies the rolling attention state (window rings, compressor partial groups) to the host, and back.
     /// The compressed caches below `positions`, to and from the host; ensure_positions backs them first.
     virtual size_t cache_bytes(int64_t positions) const { (void) positions; return 0; }
     virtual bool save_cache(void* stream, int64_t positions, std::vector<core::ConversationKv>& kv, std::string& err) { (void) stream; (void) positions; (void) kv; (void) err; return true; }
     virtual bool restore_cache(void* stream, const std::vector<core::ConversationKv>& kv, std::string& err) { (void) stream; (void) kv; (void) err; return true; }
+    /// The rolling attention state (window rings, compressor partial groups): its bytes and where it lives.
     virtual size_t turn_bytes() const { return 0; }
-    virtual void save_turn(void* stream, uint8_t* host) { (void) stream; (void) host; }
-    virtual void restore_turn(void* stream, const uint8_t* host) { (void) stream; (void) host; }
+    virtual void turn_regions(std::vector<core::DeviceRegion>& out) const { (void) out; }
+    /// The regions hold a checkpoint's bytes again: the ring starts empty.
+    virtual void turn_restored() {}
     /// Forgets the conversation (a new sequence starts at position 0).
     virtual void reset() {}
     /// Called once per token, or per window of `n_tokens`, before its layers run.
@@ -83,9 +89,9 @@ public:
     }
     /// The rows of the last window before `next_pos` join the carried state; the rest leave no trace.
     virtual void commit_window(int64_t next_pos, void* stream) { (void) next_pos; (void) stream; }
-    /// What waits for an idle bus goes now: a few pieces once a token's or window's last launches went out (`all` false),
-    /// the rest once the drafter's inputs went out (`all` true); the next token issues what is left.
-    virtual void end_window(bool all) { (void) all; }
+    /// What waits for an idle bus goes now, once a token's or window's last launches went out: its copies yield to the
+    /// output's and the next window's, and land while the drafter runs.
+    virtual void end_window() {}
     /// A verify window: attention of the `n_tokens` staged rows; `x`, `out`: [n_tokens][n_embd].
     virtual bool attention_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
     /// Enqueues what the routed experts read of `n_tokens` normed rows x [n_tokens][n_embd]: their copy in pinned host

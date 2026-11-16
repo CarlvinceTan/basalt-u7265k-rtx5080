@@ -57,6 +57,9 @@ public:
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
     /// One token-embedding row, dequantised into `out` (n_embd floats).
     bool embedding_row(int32_t token, float* out, std::string& err) const;
+    /// Asks the OS file cache for the whole token embedding: a window reads a row per token, the drafter's anchor
+    /// first, and a row the cache lacks waits for the disk.
+    void warm_token_table() const;
     ngram::PleReader& engram_reader() const { return *engram_; }
     int experts_fd() const { return experts_fd_; }
     const std::string& path() const { return path_; }
@@ -81,9 +84,11 @@ public:
     /// What the flags ask of the expert tiers.
     const model::LoadRequest& tiers() const { return tiers_; }
     void set_tiers(const model::LoadRequest& req) { tiers_ = req; }
-    /// The CUDA device of the second card's expert tier, or -1.
-    int peer_device() const { return peer_device_; }
-    void set_peer_device(int d) { peer_device_ = d; }
+    /// The CUDA devices of the second cards' expert tiers (each holds a block of layers), in order; empty without any.
+    const std::vector<int>& peer_devices() const { return peer_devices_; }
+    void set_peer_devices(std::vector<int> d) { peer_devices_ = std::move(d); }
+    /// The first second card, or -1.
+    int peer_device() const { return peer_devices_.empty() ? -1 : peer_devices_[0]; }
     /// The CUDA device the dense tensors live on.
     int device() const { return device_; }
     /// The sizes the prompt path's workspaces depend on.
@@ -105,7 +110,7 @@ private:
     std::map<std::string, DevTensor> dev_;
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
-    int peer_device_ = -1;
+    std::vector<int> peer_devices_;
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;

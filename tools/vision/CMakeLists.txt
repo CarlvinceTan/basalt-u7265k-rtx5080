@@ -23,9 +23,12 @@ find_package(Threads REQUIRED)
 
 set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 
-# host side: preprocessing, projector file, CPU encoder
+# host side: preprocessing, FFmpeg loaded at run time, projector file, CPU encoder
 add_library(vision_core STATIC
   ${VISION_ROOT}/src/vision/preprocess.cpp
+  ${VISION_ROOT}/src/vision/ffmpeg_api.cpp
+  ${VISION_ROOT}/src/vision/video.cpp
+  ${VISION_ROOT}/src/vision/mrope_positions.cpp
   ${VISION_ROOT}/src/vision/mmproj.cpp
   ${VISION_ROOT}/src/vision/encoder_cpu.cpp
   ${VISION_ROOT}/src/vision/gemm_cpu.cpp
@@ -54,7 +57,7 @@ target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
 add_executable(basalt-vision vision.cpp)
 target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)
 target_link_libraries(basalt-vision PRIVATE vision_cuda)
-set_target_properties(basalt-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${VISION_ROOT}/bin)
+basalt_ship_to_bin(basalt-vision)
 # The image and projector paths arrive on the command line, so this program needs the same manifest as the engine:
 # UTF-8 as the process code page and long paths. Built here directly rather than through the root project's helper,
 # because this project also configures on its own.

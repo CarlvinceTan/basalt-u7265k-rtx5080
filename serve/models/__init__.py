@@ -13,8 +13,22 @@ class Dialect:
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
+    video_pad = ""                          # the prompt token for one row of a video group ("": the model reads no video)
+    video_marker = ""                       # what the template writes for a video, replaced by video_text
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
+    # what the model's template does with a conversation, as llama.cpp's /props `chat_template_caps` names it
+    caps = {"supports_tool_calls": False, "supports_parallel_tool_calls": False, "supports_reasoning_effort": False,
+            "supports_system_role": False, "supports_preserve_reasoning": False}
+
+    def template_kwargs(self, kwargs: dict) -> dict:
+        """The frontend's template kwargs as this model's template names them: `preserve_reasoning` (keep earlier
+        turns' thinking in the prompt) becomes the template's own switch."""
+        if "preserve_reasoning" not in kwargs:
+            return kwargs
+        out = dict(kwargs)
+        out["preserve_thinking"] = out.pop("preserve_reasoning")
+        return out
 
     def effort_level(self, level):
         """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""
@@ -37,6 +51,11 @@ class Dialect:
         prompt is rendered."""
         raise NotImplementedError
 
+    def video_text(self, times: list[float], rows: int) -> str:
+        """The prompt text for a video in place of video_marker: per two-frame group its time (seconds) and its run of
+        `rows` video pads."""
+        raise NotImplementedError
+
     def forced_opening(self, name: str | None) -> str:
         """The text that opens a call to tool `name` (None: any tool), for a forced tool choice."""
         raise NotImplementedError
@@ -47,7 +66,7 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()
-    if arch in ("qwen4exp", None):
-        from serve.models.qwen4exp import Qwen4Exp
-        return Qwen4Exp()
+    if arch in ("qwen4exp", "qwen35", None):
+        from serve.models.qwen import Qwen
+        return Qwen()
     raise ValueError(f"no dialect for architecture {arch!r}")

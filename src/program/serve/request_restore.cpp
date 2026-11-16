@@ -13,6 +13,7 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 }
 
 Flow Request::restore() {
+    runtime_.ckd_finish();   // a save that a request left behind (an error, a cancel) lands before anything moves
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.
@@ -280,10 +281,11 @@ Flow Request::restore() {
         from_live = in_live;
         retain_image();
         incoming.reset();   // its running state and checkpoints are in the session now
+        const double restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count();
         basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
-                     (long long) resume, from_live ? "live" : "checkpoint",
-                     std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),
+                     (long long) resume, from_live ? "live" : "checkpoint", restore_ms,
                      runtime_.conversations->size(), runtime_.conversations->bytes());
+        runtime_.report_conversations((long long) resume, restore_ms);
     }
     runtime_.ckd_finish();
     if (want_cvec != runtime_.cvec_cached) {

@@ -285,6 +285,20 @@ void test_resident_lend_region() {
             "free places that do not fit must leave the whole budget to the lent slots");
     require(choose_resident_room(slots, 10, 100, 1, 0, fit) == 1 && !fit, "no free places asked for");
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
+    // a RAM budget keeps the lend region only when it holds the whole complement
+    require(budget_lend_room(0, 10) == 0, "no budget");
+    require(budget_lend_room(9, 10) == 0, "a budget short of the complement kept the lend region");
+    require(budget_lend_room(10, 10) == 10, "a budget of exactly the complement must keep the lend region");
+    require(budget_lend_room(68, 39) == 68, "a budget above the complement must give the lend region its rest");
+    require(budget_lend_room(17, 10) - 10 == 7, "the lend region's room is what the budget has after the complement");
+    // the caller asks with the complement plus the adaptive swaps' free places (#342, #366): a budget that holds the
+    // experts but not the places keeps no lend region, so the places stay; one that holds both keeps it
+    constexpr uint64_t experts = 3779, places = 75;   // 37.79 GiB and 749 MiB, in 10 MiB
+    require(budget_lend_room(3700, experts + places) == 0, "a budget short of the experts kept the lend region");
+    require(budget_lend_room(3800, experts + places) == 0, "a budget between the experts and the places kept the lend region");
+    require(budget_lend_room(experts + places - 1, experts + places) == 0, "a budget one short of the places kept it");
+    require(budget_lend_room(experts + places, experts + places) == experts + places, "a budget holding both must keep it");
+    require(budget_lend_room(3900, experts + places) == 3900, "a budget above both must give the lend region its rest");
 }
 
 // A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS
