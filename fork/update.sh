@@ -1,7 +1,7 @@
 #!/bin/bash
-# fork/update.sh - bring basalt-u7265k-rtx5080 up to upstream main, rebuild, check, and deploy.
+# fork/update.sh - merge upstream main into basalt-u7265k-rtx5080, rebuild, check, and deploy.
 #
-#   fork/update.sh            rebase onto origin/main, build, run the parity tests, freeze into bin-deployed/
+#   fork/update.sh            merge origin/main, build, run the parity tests, freeze into bin-deployed/
 #   fork/update.sh --deploy   ... and restart the basalt service on the new binary (fork.conf drop-in)
 #   fork/update.sh --no-fetch rebuild and re-check the current tree only
 #
@@ -23,9 +23,13 @@ if [ $FETCH = 1 ]; then
   git diff --quiet && git diff --cached --quiet || { echo "uncommitted changes: commit or stash first"; exit 1; }
   git fetch -q origin
   echo "upstream: $(git rev-list --count HEAD..origin/main) new commits"
-  git rebase origin/main || { echo "rebase stopped on a conflict: resolve it, 'git rebase --continue', then run with --no-fetch"; exit 1; }
+  # A merge, not a rebase: the branch is pushed to the fork remote, and a merge keeps the fork's commits as they are
+  # (no force-push) and leaves each upstream sync as one commit that shows what was taken and how conflicts went.
+  git merge --no-edit origin/main || { echo "merge stopped on a conflict: resolve it, 'git commit', then run with --no-fetch"; exit 1; }
 fi
 
+# upstream builds test targets only with BUILD_TESTING (#370); the parity tests below need them
+cmake -S . -B build -DBUILD_TESTING=ON >/dev/null
 cmake --build build --target basalt basalt-bench basalt-probe basalt-vision kq_vnni_test q50_vnni_test pool_tasks_test native_expert_parity dec_moe_parity -j "$(nproc)"
 
 echo "== parity"

@@ -4,9 +4,9 @@ A fork of [Basalt](https://github.com/jesdga95/basalt) tuned for one machine: an
 8 Lion Cove P-cores + 12 Skymont E-cores, AVX2 + AVX-VNNI + AVX-VNNI-INT8, no AVX-512), **2 x 48 GB DDR5-6000**
 (dual channel, dual rank) and an **RTX 5080** (16 GB, PCIe 5.0 x16), serving **Qwen3.8-Flash-Next UD-Q4_K_XL**.
 
-The branch `basalt-u7265k-rtx5080` is upstream `main` plus a short stack of commits; `fork/update.sh` rebases it on
-upstream, rebuilds, runs the parity tests and only then deploys, so upstream's work keeps flowing in.  It sits on
-upstream v0.3.2 (2026-11-09).
+The branch `basalt-u7265k-rtx5080` is a short stack of commits with upstream `main` merged in; `fork/update.sh` merges
+upstream, rebuilds, runs the parity tests and only then deploys, so upstream's work keeps flowing in.  Upstream was
+last merged at 0.4.0 (2026-11-15).
 
 Every change below either leaves the output **bit for bit** what upstream computes (checked by the tests named), or is
 off unless switched on.  One exception is marked: where experts are placed, which moves replies the way upstream's own
@@ -111,7 +111,7 @@ python3 tools/convert/convert.py --gguf SET/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-
 ## Updating from upstream
 
 ```bash
-fork/update.sh            # rebase on origin/main, build, parity tests, freeze bin-deployed/
+fork/update.sh            # merge origin/main, build, parity tests, freeze bin-deployed/
 fork/update.sh --deploy   # ... and restart the basalt service on it (fork/fork.conf drop-in)
 ```
 
