@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.4.0 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.4.1 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -16,6 +16,9 @@ endif()
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
 # Covers the project's own C++ and CUDA sources only; off by default so a newer compiler's new warning cannot break a user build.
 option(WERROR "Treat compiler warnings as errors" OFF)
+# Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
+# allows a non-Blackwell card to serve as the expert tier, but adds build time.
+option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -37,11 +40,13 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# One architecture only: the kernels use its instructions and nothing else is tested.
+# Main kernels (NVFP4 tensor cores, TMA, Blackwell instructions) compile for sm_120 only.
+# When PEER_ADA is enabled, peer kernels (Q8_1/Q2_0 expert rows, standard CUDA) additionally compile
+# for sm_89 (Ada) so a non-Blackwell card can serve as the expert tier.
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
   if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only (peer-arch kernels are compiled separately below)")
   endif()
 endforeach()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
@@ -114,7 +119,9 @@ else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
   set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni;-mbmi2")
-  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8")
+  # -mno-avx512f keeps the file below EVEX under a global -march=native: there vpdpbssd lands on ymm16+, which
+  # only its AVX10.2 form encodes, so the assembler refuses it or emits an instruction AVX-512 CPUs do not run.
+  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8;-mno-avx512f")
   set(_isa_avx1_flags "-mavx")
 endif()
 
@@ -379,6 +386,46 @@ add_executable(basalt-load src/models/qwen4exp/plan/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
 endif()
 
+# Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
+# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+if(PEER_ADA)
+  add_compile_definitions(BASALT_PEER_ADA=1)
+  set_source_files_properties(
+    src/models/qwen4exp/kernels/dec_moe.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu
+    src/prefill/moe_mmq.cu
+    src/prefill/mmq/mmq_host.cu
+    src/prefill/mmq/quantize.cu
+    src/prefill/mmq/instances/mmq_q2_0.cu
+    src/prefill/mmq/instances/mmq_iq1_s.cu
+    src/prefill/mmq/instances/mmq_iq1_m.cu
+    src/prefill/mmq/instances/mmq_iq2_xxs.cu
+    src/prefill/mmq/instances/mmq_iq2_xs.cu
+    src/prefill/mmq/instances/mmq_iq2_s.cu
+    src/prefill/mmq/instances/mmq_iq3_xxs.cu
+    src/prefill/mmq/instances/mmq_iq3_s.cu
+    src/prefill/mmq/instances/mmq_iq4_nl.cu
+    src/prefill/mmq/instances/mmq_iq4_xs.cu
+    src/prefill/mmq/instances/mmq_q8_0.cu
+    src/prefill/mmq/instances/mmq_q5_0.cu
+    src/prefill/mmq/instances/mmq_q5_1.cu
+    src/prefill/mmq/instances/mmq_q2_k.cu
+    src/prefill/mmq/instances/mmq_q3_k.cu
+    src/prefill/mmq/instances/mmq_q4_k.cu
+    src/prefill/mmq/instances/mmq_q5_k.cu
+    src/prefill/mmq/instances/mmq_q6_k.cu
+    src/kernels/cuda/iq_kernels.cu
+    src/kernels/cuda/quantize_act.cu
+    src/kernels/cuda/wait_abort.cu
+    src/kernels/cuda/sampler.cu
+    src/kernels/cuda/elementwise.cu
+    PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
+endif()
+
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
@@ -595,6 +642,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/serve/request_parse.cpp
             src/program/serve/request_prefill.cpp
             src/program/serve/request_restore.cpp
+            src/program/serve/prompt_handles.cpp
             src/program/serve/session_engine.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
@@ -1443,6 +1491,11 @@ if(BUILD_TESTING)
   add_executable(conv_cache_test tests/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   basalt_cpu_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # a held conversation met against a prompt, the model's own pieces standing for the same bytes (header-only, CPU)
+  add_executable(prefix_anchor_test tests/program/prefix_anchor_test.cpp)
+  target_include_directories(prefix_anchor_test PRIVATE src)
+  target_link_libraries(prefix_anchor_test PRIVATE warnings)
+  basalt_cpu_test(NAME prefix_anchor_test COMMAND prefix_anchor_test)
   # where a prompt read from token 0 places the chain's root: the system prompt's end, never the reply's header (CPU)
   add_executable(prompt_parts_test tests/program/prompt_parts_test.cpp)
   target_include_directories(prompt_parts_test PRIVATE src)

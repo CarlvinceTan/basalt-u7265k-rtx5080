@@ -15,11 +15,13 @@
 #include "models/deepseek41/prefill_plan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -129,8 +131,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
 
     // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
     // comes only when experts may stay in the file.
-    core::detail::HostMemory hm;
-    auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
+    platform::HostMemory hm;
+    auto available = [&] { return platform::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
     uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
@@ -577,7 +579,8 @@ void ExpertTier::seed_copies(int64_t n) {
             if (!pinned(l, e) || res_[(size_t) l * n_expert_ + e] >= 0) continue;
             ++tick_;
             if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
-                cudaStreamSynchronize(copy_stream_);
+                if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+                    basalt::log::error("basalt deepseek41", "tier seed copy sync: %s", cudaGetErrorString(ce));
                 land_all();
                 ++tick_;
                 if (claim(l, e, blob_of(l, e), copy_stream_) < 0) return;
@@ -585,7 +588,8 @@ void ExpertTier::seed_copies(int64_t n) {
             ++placed;
         }
     }
-    cudaStreamSynchronize(copy_stream_);
+    if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
+        basalt::log::error("basalt deepseek41", "tier seed sync: %s", cudaGetErrorString(ce));
     land_all();
 }
 
@@ -634,7 +638,8 @@ void ExpertTier::land(int layer) {
             pending_[keep++] = p;
             continue;
         }
-        cudaEventSynchronize(events_[(size_t) p.event]);
+        if (const cudaError_t ce = cudaEventSynchronize(events_[(size_t) p.event]); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier land layer %d sync: %s", layer, cudaGetErrorString(ce));
         apply(p);
     }
     pending_.resize(keep);
@@ -656,7 +661,8 @@ void ExpertTier::land(int layer) {
 void ExpertTier::land_all() {
     issue(-1, kAllPieces);
     for (const Pending& p : pending_) {
-        cudaEventSynchronize(events_[(size_t) p.event]);
+        if (const cudaError_t ce = cudaEventSynchronize(events_[(size_t) p.event]); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier land_all layer %d sync: %s", p.layer, cudaGetErrorString(ce));
         apply(p);
     }
     pending_.clear();
@@ -672,9 +678,11 @@ void ExpertTier::settle() {
     std::string err;
     if (!await_reads(err)) basalt::log::error("basalt deepseek41", "%s", err.c_str());
     land_all();
-    cudaStreamSynchronize(copy_stream_);
-    cudaStreamSynchronize(out_stream_);
-    cudaStreamSynchronize(fetch_stream_);
+    for (const auto& [name, st] : std::array<std::pair<const char*, cudaStream_t>, 3>{
+             {{"copy", copy_stream_}, {"out", out_stream_}, {"fetch", fetch_stream_}}}) {
+        if (const cudaError_t ce = cudaStreamSynchronize(st); ce != cudaSuccess)
+            basalt::log::error("basalt deepseek41", "tier settle %s sync: %s", name, cudaGetErrorString(ce));
+    }
 }
 
 void ExpertTier::begin_token(int n_tokens) {

@@ -15,6 +15,9 @@ is refused with a 400 that names the length. `--slot-full-context` gives every s
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
+The engine tokenizes every prompt and matches it against what each slot holds. A reply the client sends back unchanged continues the
+slot's own tokens even when the model wrote it in other pieces than the tokenizer cuts the same bytes into (not with images).
+
 ### Session affinity
 
 With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
@@ -40,12 +43,14 @@ Each request ends with one `done` line:
 ```
 
 - `pp=<prompt tokens>/<cached>c`: the rate counts newly read tokens only.
-- `acc`: drafts accepted over drafts offered. `dl`: tokens per window. Both are absent when the request did not draft.
+- `acc`: drafts accepted over drafts offered. `dl`: tokens per window, from the engine's own window count over the whole request (its solo and batch runs and every pass). With `--parallel` a window serves every busy slot in a fixed number of rows, so `dl` falls toward 1.0 as the slots fill. Both are absent when the request did not draft.
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
-taken from the file); `[server] engine log: PATH` names it when the engine fails to start. The folder also holds the conversation
+taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
+next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
+it was in) and the server's warning quotes it with the exit status. The folder also holds the conversation
 cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
 read the vision projector inside it.
 
@@ -87,7 +92,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
-  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Flash-Next's copy and top-up also leave 2 GiB beside the reserve
+  for the host memory the engine takes after they read the free RAM (CUDA graphs, the first request), so the free RAM settles
+  above the guard, not on it. When some experts stay in the file, the
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s

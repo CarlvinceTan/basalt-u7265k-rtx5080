@@ -35,8 +35,10 @@ struct GpuSpec {
 /// Parses "", "auto" or "A,B,..."; false with `err` naming what is wrong.
 bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
 
-/// Whether Basalt runs on the card: compute capability 12.0, or unknown (nothing to check against).
-bool gpu_supported(const GpuCard& c);
+/// Whether the card can be the main card: compute capability 12.0, or unknown (nothing to check against).
+bool gpu_main_supported(const GpuCard& c);
+/// Whether the card can be a second card: as the main card, or 8.9 in a build with -DPEER_ADA=ON.
+bool gpu_peer_supported(const GpuCard& c);
 
 /// "GPU 1 (RTX 5060 Ti)": the visible number the user types, and the name when known.
 std::string gpu_label(const std::vector<GpuCard>& visible, int index);
@@ -80,6 +82,10 @@ struct TierRoom {
 /// fewest so far for its bandwidth among those it still fits, so the hot experts split by bandwidth and every tier
 /// fills. A tier closes at the first expert that no longer fits it. Returns each expert's tier, -1 when none takes it.
 std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
+
+/// The tiers, ascending, that spread_experts gives at least one expert. A tier left out has nothing to hold (no expert
+/// outside the main card, or no room for one) and takes no part in the expert tier.
+std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
 
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.

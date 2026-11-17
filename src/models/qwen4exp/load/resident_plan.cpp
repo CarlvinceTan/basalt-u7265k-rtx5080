@@ -215,7 +215,7 @@ int resident_plan(Context& context) {
         in.ram_total = basalt::platform::total_physical_memory();
         // the container-aware reading (a memory cap below the machine's RAM), the one the RAM copy is checked against
         in.ram_available = basalt::platform::available_memory();
-        if (basalt::core::detail::HostMemory hm; basalt::core::detail::host_available_memory(hm) && hm.available > 0)
+        if (basalt::platform::HostMemory hm; basalt::platform::host_available_memory(hm) && hm.available > 0)
             in.ram_available = in.ram_available > 0 ? std::min(in.ram_available, hm.available) : hm.available;
         in.peer = o.peer_devices.size() == 1 && o.resident_cpu_experts;   // peer-exclusive: one tier card
         in.serve = o.serve;
@@ -241,7 +241,7 @@ int resident_plan(Context& context) {
         in.extra_peer_excl = lent_bytes + spares_excl;
         in.floor_bytes = in.ram_available - basalt::core::ram_tier_room(
             in.ram_available,
-            std::max(o.resident_headroom, basalt::platform::ram_reserve()) +
+            std::max(o.resident_headroom, basalt::core::plan_reserve(basalt::platform::ram_reserve())) +
                 basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes()),
             o.resident_pin);
         bp::AutoGiven& gv = in.given;
