@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "model": "/home/carl/models/basalt-ud/Qwen3.8-FN-UD-IQ3_XXS-abliterated.basalt",
+      "gpu": "0",
+      "kv": "int8",
+      "max-context": 262144,
+      "vision": "dynamic"
+    }
+  ],
+  "engine": {
+    "resident-experts": true,
+    "pool-affinity": "all",
+    "pool-workers": 18,
+    "prefill-cpu-share": 0.5,
+    "vram-reserve-mib": 300,
+    "expert-profile-save": "/home/carl/.cache/basalt/iq3xxs.prof",
+    "conversation-cache-mib": 4096,
+    "conversation-cache-min-tokens": 8192,
+    "conversation-cache-disk-mib": 16384,
+    "kv-resident": 20480
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 11001
+  }
+}
