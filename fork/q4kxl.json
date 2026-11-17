@@ -18,7 +18,8 @@
     "expert-profile-save": "/home/carl/.cache/basalt/q4kxl-fork.prof",
     "conversation-cache-mib": 4096,
     "conversation-cache-min-tokens": 8192,
-    "conversation-cache-disk-mib": 16384
+    "conversation-cache-disk-mib": 16384,
+    "kv-resident": 20480
   },
   "server": {
     "host": "127.0.0.1",
