@@ -1765,6 +1765,54 @@ class LoadProgress(unittest.TestCase):
         bars.say("[server] warning: x")
         self.assertIn("\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
+    def test_the_one_bar_says_where_the_engine_places(self):
+        from serve.engine.progress import LoadBars, load_into
+        self.assertEqual(load_into("basalt load: into cuda0"), "cuda0")
+        self.assertEqual(load_into("basalt load: into ram"), "ram")
+        self.assertIsNone(load_into("basalt load: into disk"))
+        self.assertIsNone(load_into("basalt load: weights 1 2"))
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])                               # CUDA ordinals 0, 1 are nvidia-smi 2, 3
+        bars.set_total(4 << 30)
+        bars.set_stages(["cuda0", "cuda1", "ram"])
+        bars.set_into("cuda0")                                          # each card's share in turn, first
+        bars.update("weights", 1 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda2 [" + "=" * 6 + ">" + " " * 17 + "]   1.0/4.0 GiB"])
+        bars.set_into("cuda1")
+        bars.update("weights", 2 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda3 [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        bars.set_into("ram")                                            # then RAM, on the same bar, which stays put
+        self.assertEqual(bars.lines(), ["[server] loading model weights: ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        self.assertTrue(out.getvalue().splitlines()[-1].endswith("ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"))
+        log = io.StringIO()                                             # off a terminal: one line at each change
+        bars = LoadBars(log)
+        bars.set_total(4 << 30)
+        bars.set_into("cuda0")                                          # before the first bytes: nothing to show yet
+        bars.update("weights", 3 << 30, 4 << 30)
+        bars.set_into("ram")
+        self.assertEqual(log.getvalue().splitlines(),
+                         ["[server] loading model weights: ram   [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB"])
+
+    def test_four_cards_then_ram_on_one_bar_that_never_shifts(self):
+        from serve.engine.progress import LoadBars, load_stages
+        stages = load_stages("basalt load: stages cuda0 cuda1 cuda2 cuda3 ram")
+        self.assertEqual(stages, ["cuda0", "cuda1", "cuda2", "cuda3", "ram"])
+        self.assertIsNone(load_stages("basalt load: stages disk"))
+        bars = LoadBars(Tty(), gpus=[3, 10, 1, 0])                      # nvidia-smi numbers: cuda10 is the widest
+        bars.set_total(10 << 30)
+        bars.set_stages(stages)
+        seen = []
+        for i, target in enumerate(stages):
+            bars.set_into(target)
+            bars.update("weights", (2 * i + 1) << 30, 10 << 30)
+            seen.append(bars.lines()[0])
+        heads = [line.split(" [")[0] for line in seen]
+        self.assertEqual(heads, ["[server] loading model weights: cuda3 ", "[server] loading model weights: cuda10",
+                                 "[server] loading model weights: cuda1 ", "[server] loading model weights: cuda0 ",
+                                 "[server] loading model weights: ram   "])
+        self.assertEqual(len({line.index("[", 9) for line in seen}), 1)   # the bar starts in one column throughout
+        self.assertTrue(seen[-1].endswith("]   9.0/10.0 GiB"))
+
     def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
         bars = LoadBars(io.StringIO())
@@ -2812,6 +2860,19 @@ class CachingThinkingEngine(ThinkingEngine):
                          "finish": "stop", "reused": min(reused, len(ids)), "hits": 9, "lookups": 10}
 
 
+class TimedThinkingEngine(CachingThinkingEngine):
+    """CachingThinkingEngine with the engine's read times: the first pass reads the prompt (READ ms), a later pass
+    only the few tokens that continue the reply (CONTINUE ms)."""
+    READ, CONTINUE = 1000.0, 5.0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        first = not self.prompts
+        try:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            self.last = dict(self.last, prompt_ms=self.READ if first else self.CONTINUE)
+
+
 class ThinkingBudget(unittest.TestCase):
     """reasoning_budget_tokens: at the budget the thinking is wrapped up and the model answers."""
 
@@ -2867,6 +2928,19 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["cache_n"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["prompt_n"] + b["timings"]["cache_n"], b["usage"]["prompt_tokens"])
+
+    def test_prompt_time_of_a_wrapped_up_request_comes_from_its_first_pass(self):
+        """The prompt is read in the first pass; a later pass's read time, beside the whole prompt, gave a rate
+        hundreds of times too high."""
+        self.engine = TimedThinkingEngine(self.tok)
+        self.svc.engine = self.engine
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)
+        t = b["timings"]
+        self.assertEqual(t["prompt_ms"], TimedThinkingEngine.READ)
+        self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / (TimedThinkingEngine.READ / 1000), places=1)
+        self.assertEqual(self.svc.history[-1]["prompt_ms"], TimedThinkingEngine.READ)
 
     def test_the_budget_wraps_up_the_thinking(self):
         from serve.service import REASONING_CLOSE

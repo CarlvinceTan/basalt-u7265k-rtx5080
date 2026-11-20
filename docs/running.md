@@ -22,10 +22,10 @@ slot's own tokens even when the model wrote it in other pieces than the tokenize
 
 With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
 there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
-`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`. A request with none picks a slot by the longest shared prefix, then
-the least recently used. When the session's slot is busy, the request takes that normal pick and the session's slot becomes the new
-one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel subagents, so their overlapping requests spread
-over slots.
+`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`, `x-grok-conv-id`, `x-grok-session-id`. A request with none picks a
+slot by the longest shared prefix, then the least recently used. When the session's slot is busy, the request takes that normal pick
+and the session's slot becomes the new one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel
+subagents, so their overlapping requests spread over slots.
 
 ### Prompts beside decoding slots
 
@@ -119,7 +119,9 @@ last bits of the logits, so a greedy answer can fork after some tokens (`dynamic
 | `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB pinned RAM) | 0.77 s / 1.45 s / 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s / 40 s / 70 s |
 
-`dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after. Which
+`dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after.
+Hy4-flash reads images with `dynamic` only: its main-card expert slots go back for the request's pictures and fill again as after a
+prompt. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
 
 ## Video
