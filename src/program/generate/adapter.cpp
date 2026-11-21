@@ -254,7 +254,7 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
             }
         } else if (cap > 1) {
             basalt::model::Result dres = sess->draft_begin(next, pos, cap - 1);
-            if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft);
+            if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft, {});   // a fixed window verifies every draft
             if (dres.ok() && !basalt::core::diagnostics().draft_log.empty()) {   // --draft-log: the position, the anchor and the drafts of each window
                 if (std::FILE* f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a")) {
                     std::fprintf(f, "D %lld %d", (long long) pos, next);
@@ -392,6 +392,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         lreq.rope = o.rope;
+        lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
         lreq.card_gbps.push_back(o.main_gbps);
         lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());

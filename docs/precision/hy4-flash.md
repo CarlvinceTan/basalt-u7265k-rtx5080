@@ -24,7 +24,7 @@ deterministic and runs once in the converter; `convert.py --verify` repeats it a
 | Norms, hyper-connections, router, biases | F32 | as stored |
 | Engram table | E4M3 codes, no scale | each BF16 value to the nearest code, ties to even; few of the values are E4M3 already (9% exact, 2.7% RMS error) |
 | Vision encoder and projector | BF16 (convolutions and position table F32) | as stored |
-| DFly2 drafter | BF16 in the file; projections rounded to Q8_0 as they load (`kv_b` stays BF16), vectors widened to FP32; the drafts read the target's Q8_0 head | drafting only: cannot change output |
+| DFly2 drafter | BF16 in the file; projections rounded as they load, the attention's gate and output and the MLP to Q4_0 and the rest to Q8_0 (ggml's reference roundings; `kv_b` stays BF16), vectors widened to FP32; the drafts pick from the target's Q8_0 head through a 2-bit copy of its rows, the rows near the copy's best scored exactly | drafting only: cannot change output |
 
 The routed experts' weight RMS error is 0.081 in NVFP4 (the Q4_K_M test pack: 0.071 gate and up, 0.077 Q4_K down, 0.018 Q6_K
 down on 19 layers).
@@ -85,8 +85,8 @@ in one chunk against 1,024-row chunks gives last-row KL 0.0032.
 `--spec` verifies up to 6 rows at once (the default). Each verify row equals plain decode's, including the indexer's pooled keys,
 which are built from the same raw rows whichever window completes a group. The drafter reads the target's caches without writing
 them and keeps its block's rows in scratch, so a rejected block leaves nothing behind. With the tiers pinned, drafted output is
-plain decoding's token for token. The drafter's own rounding (Q8_0 projections, FP8 block rows with `--kv fp8`) changes only
-which drafts are accepted.
+plain decoding's token for token. The drafter's own rounding (Q8_0 and Q4_0 projections, the head's 2-bit screen, FP8 block
+rows with `--kv fp8`) changes only which drafts are accepted.
 
 ## Against the BF16 reference
 
@@ -110,3 +110,32 @@ a layer). Measured through the gate above (T 1, tiers frozen), against the same 
 
 At one placement the head moves mean KLD by +0.00001 and top-1 by 0.03 points (the largest change of one row's NLL 0.077). Placement
 alone moves more: the same 50 chunks with the BF16 head score 0.21549 at 133 copies against 0.21232 at 130.
+
+## Lossy routing flags
+
+What the flags do: [quality](quality.md#lossy-routing-flags). Here k is 16, so `--route-tail-skip` takes R 1 to 15 (bare 15), and
+`--route-prior` adds LAMBDA to the sigmoid score plus its bias, which the top 16 is taken from (bare 0.01).
+
+Two cards (400 W + 180 W), the default placement, the 0.5.0 engine's BF16 head. Speed: `basalt-bench -t conv,struct,prose
+--seed 1`, one cold run each (off twice, before and after the rest); ms a window is the step time. CPU and bus picks: the run's `TIER final` line. Quality: the gate at 50
+chunks against the BF16 base (12,750 rows; this subset's off row reads 0.2069, the 100-chunk one 0.201).
+
+| Flags | CPU / bus picks | conv tok/s, ms/w | struct tok/s, ms/w | prose tok/s, ms/w | KLD | Same top-1 |
+|---|---:|---:|---:|---:|---:|---:|
+| off | 6.9% / 2.7% | 86.2, 24.79 | 173.8, 33.48 | 85.4, 20.22 | 0.2069 | 86.10% |
+| `--route-tail-skip 15` | 6.0% / 2.2% | 97.8, 23.77 | 180.7, 32.04 | 86.9, 19.36 | 0.2056 | 86.07% |
+| `--route-tail-skip 12` | 4.2% / 1.2% | 110.8, 20.50 | 208.4, 28.37 | 102.8, 17.40 | 0.2373 | 85.57% |
+| `--route-tail-skip 8` | 2.2% / 0.4% | 126.1, 17.64 | 228.6, 25.86 | 111.2, 15.93 | 0.2826 | 83.94% |
+| `--route-prior 0.01` | 4.4% / 1.4% | 108.1, 21.84 | 200.5, 29.27 | 98.9, 18.33 | 0.2212 | 85.70% |
+| `--route-prior 0.03` | 2.6% / 0.7% | 116.5, 19.43 | 219.1, 26.76 | 108.4, 16.60 | 0.2465 | 85.33% |
+| `--route-prior 0.1` | 1.0% / 0.2% | 129.9, 18.65 | 224.2, 26.42 | 115.6, 15.85 | 0.2941 | 83.82% |
+| both (0.1, 12) | 1.0% / 0.2% | 130.6, 18.50 | 224.6, 26.37 | 110.0, 16.08 | 0.2965 | 83.83% |
+
+Decode here waits on the CPU's experts and the bus copies, so dropping them pays directly: `--route-tail-skip 15` (12% of the misses
+dropped) costs nothing the gate sees for 4% of conv's window, 12 (44% dropped) cuts it by 17% for +0.030 KLD, 8 (76%) by 29% for
++0.076. `--route-prior 0.01` cuts 12% for +0.014; 0.1 empties the CPU's share but costs +0.087 and 2.3 points of top-1. With the prior
+on, few misses are left for the tail skip. The gate's PPL falls as the error grows (14.85 off, 13.77 at R 8), so it is no measure
+of closeness here; KLD and top-1 are.
+
+With the Q8_0 head the same steps hold: off 24.0 ms a conv window (two runs, 22.5 and 25.6) and KLD 0.2060; R 15 23.1 ms and
+0.2091; R 12 20.6 ms and 0.2402; LAMBDA 0.01 21.5 ms and 0.2295. A KLD step under about 0.005 is placement noise.

@@ -93,7 +93,7 @@ public:
                 return false;
             }
         const size_t n = (size_t) g_.n_embd;
-        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow, nullptr);   // [T - 1][layer][with previous tail]
+        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow * 2, nullptr);   // [lossy][T - 1][layer][with previous tail]
         tail_g_.assign((size_t) g_.n_layers * kMaxWindow, nullptr);
         constexpr int W = kMaxWindow;
         auto buf = [&](float*& p, size_t floats) {
@@ -210,7 +210,7 @@ public:
         return {};
     }
 
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         DsparkDraft d;
@@ -222,6 +222,16 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        {
+            std::string e;
+            core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+            lossy_ = t && t->route_lossy() ? t : nullptr;
+        }
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -333,7 +343,7 @@ public:
             if (!t->reclaim(e)) return {model::Status::Error, e};
             t->grow();
         }
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -344,7 +354,7 @@ public:
         cudaStreamSynchronize(stream_);
         release_short_prompt();
         if (!t->replan(mib, e)) return {model::Status::Error, e};
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -366,11 +376,28 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
+    std::vector<CardExperts> experts_by_card() const override {
+        std::string e;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        std::vector<CardExperts> out;
+        if (t != nullptr)
+            for (const core::ExpertTier::CardSlots& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        std::string e;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return false;
+        t->expert_map(total, homes, routed);
+        return true;
+    }
+
     std::string info_words() const override {
         std::string e;
         core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" + std::to_string(t->slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
@@ -830,6 +857,10 @@ private:
         ra.n_embd = (int) n;
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
+        if (lossy_) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(il);
+            ra.prior = lossy_->route_prior();
+        }
 
         // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
         // graph launch starts the collapse's branch first)
@@ -869,6 +900,9 @@ private:
         ops_->stage_rows(T, normed_, row_st_);
         DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        if (lossy_ && lossy_->route_tail_skip() > 0)
+            kernels::route_tail_skip(ids_, rw_, ra.held, T * g_.n_used, g_.n_used, lossy_->route_tail_skip(), g_.n_expert,
+                                     lossy_->route_counts(), st);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
@@ -919,7 +953,8 @@ private:
     int graph_row(int T) const { return T - 1; }
 
     bool run_head(int il, int64_t pos, int32_t token, bool with_prev_tail, int T = 1) {
-        return run_graph(head_g_[(((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
+        const size_t lossy = lossy_ ? (size_t) g_.n_layers * 2 * kMaxWindow : 0;
+        return run_graph(head_g_[lossy + (((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
                          [&]() { return enqueue_head(il, pos, token, stream_, with_prev_tail, T); });
     }
     bool run_tail(int il, int64_t pos, int T = 1) {
@@ -968,6 +1003,7 @@ private:
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the window's first router
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
@@ -1125,6 +1161,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     static constexpr int kHistoryCap = 4096;
     kernels::SamplerParams sampling_{};
     bool draw_kernel_ = false, bias_on_ = false;
