@@ -116,8 +116,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
     constexpr int kLoads = kRowBytes / 16;
-    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    const SegCaches& sc = a.seg.c[bk::seg_of(a.seg.at, r)];   // a batch window's row: its conversation's caches
+    const uint8_t* kbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
     // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
     const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads]) {
         const int key = t0 + lane;
@@ -310,21 +311,23 @@ __global__ void __launch_bounds__(kHeadDim) attn_combine_kernel(AttnArgs a, int 
 // attn_combine_kernel does: the same arithmetic in the same order as the three kernels. A longer window keeps the three:
 // each block would prepare up to all of its rows, and a cluster holds its idle slices' blocks.
 constexpr int kClusterSplits = 8;
-constexpr int kFusedRows = 2;
+constexpr int kFusedRows = 3;
 
+// ROWS: the window rows a block may prepare (2 for windows of 1-2 rows, 3 for 3)
+template <int ROWS>
 struct FusedSmem {
     Smem s;
-    alignas(16) uint8_t kw[kFusedRows][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
-    alignas(16) uint8_t vw[kFusedRows][kHeadDim * 2];
-    float pm[kGroup], pl[kGroup];                      // the slice's merged maximum and sum of each head
+    alignas(16) uint8_t kw[ROWS][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
+    alignas(16) uint8_t vw[ROWS][kHeadDim * 2];
+    float pm[kGroup], pl[kGroup];                 // the slice's merged maximum and sum of each head
     float pacc[kGroup][kHeadDim];
 };
 
-template <bool FP8>
+template <bool FP8, int ROWS>
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    FusedSmem& fs = *reinterpret_cast<FusedSmem*>(smem_raw);
+    FusedSmem<ROWS>& fs = *reinterpret_cast<FusedSmem<ROWS>*>(smem_raw);
     Smem& sm = fs.s;
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -375,10 +378,10 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             // the window's rows of this slice up to the block's own: both prepared from one round of loads
             const int rr0 = max(0, s_lo - p0), nr = min(r, s_hi - 1 - p0) - rr0 + 1;
             if (nr > 0) {
-                float val[2][4], raw[2][4], f[2];
-                prep::kv_rows2(pa, rr0, nr, p0 + rr0, g, w, lane, wt, val, raw, f);
+                float val[ROWS][4], raw[ROWS][4], f[ROWS];
+                prep::kv_rows<ROWS>(pa, rr0, nr, p0 + rr0, g, w, lane, wt, val, raw, f);
 #pragma unroll
-                for (int k = 0; k < 2; ++k) {
+                for (int k = 0; k < ROWS; ++k) {
                     if (k >= nr) break;
                     const int rr = rr0 + k;
                     uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
@@ -518,21 +521,36 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             }
         }
     }
-    cg::cluster_group cluster = cg::this_cluster();
-    cluster.sync();
+    // the slices' shared memory to the merging blocks: a release and an acquire of shared memory only (a cluster-wide
+    // release of every state space is a GPU-scope fence that waits for the cache and ring stores; no block of the cluster
+    // reads those)
+    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n\tbarrier.cluster.arrive.relaxed.aligned;\n\t"
+                 "barrier.cluster.wait.aligned;\n\tfence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
     if (s < kGroup) {   // head g * 3 + s: the row's slices merged with the sink, gated, rounded to q8_1 (a warp a block of 32)
         const int h = s, d = threadIdx.x;
-        const FusedSmem* part[kClusterSplits];
+        cg::cluster_group cluster = cg::this_cluster();
+        // every slice's maximum, sum and value read at once, then merged in slice order
+        float pm[kClusterSplits], pl[kClusterSplits], pv[kClusterSplits];
 #pragma unroll
-        for (int q = 0; q < kClusterSplits; ++q) part[q] = cluster.map_shared_rank(&fs, q);
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) {
+                const FusedSmem<ROWS>* part = cluster.map_shared_rank(&fs, q);
+                pm[q] = part->pm[h];
+                pl[q] = part->pl[h];
+                pv[q] = part->pacc[h][d];
+            }
         float mm = sink;
-        for (int q = 0; q < splits; ++q) mm = fmaxf(mm, part[q]->pm[h]);
+#pragma unroll
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) mm = fmaxf(mm, pm[q]);
         float ll = expf(sink - mm), aa = 0.f;
-        for (int q = 0; q < splits; ++q) {
-            const float f = expf(part[q]->pm[h] - mm);
-            ll = fmaf(part[q]->pl[h], f, ll);
-            aa = fmaf(part[q]->pacc[h][d], f, aa);
-        }
+#pragma unroll
+        for (int q = 0; q < kClusterSplits; ++q)
+            if (q < splits) {
+                const float f = expf(pm[q] - mm);
+                ll = fmaf(pl[q], f, ll);
+                aa = fmaf(pv[q], f, aa);
+            }
         float o = aa / ll;
         const int c = (g * kGroup + h) * kHeadDim + d;
         if (a.gate) o *= 1.f / (1.f + expf(-gate));
@@ -555,6 +573,12 @@ int launch_splits(int64_t max_keys) {
 
 }  // namespace
 
+int opt_in_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kOptInDevices) throw std::runtime_error("inkling2: device out of range");
+    return dev;
+}
+
 size_t attention_decode_scratch(int rows, int64_t max_keys) {
     const size_t slots = (size_t) rows * kHeads * (size_t) launch_splits(max_keys);
     return slots * (2 + kHeadDim) * sizeof(float);
@@ -566,11 +590,11 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     const int z = launch_splits(max_keys);
     float* part_ml = static_cast<float*>(scratch);
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
-    static bool attr = false;
-    if (!attr) {
+    static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
+    if (bool& set = attr[opt_in_device()]; !set) {
         cudaFuncSetAttribute(attn_split_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        attr = true;
+        set = true;
     }
     const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
     if (a.fp8) bk::launch_pdl(attn_split_kernel<true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
@@ -582,28 +606,36 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
     }
-    // a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so a
-    // cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
-    // while the products' small blocks still fit beside one
-    static size_t smem = 0;
+    // 1-2 rows, a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so
+    // a cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
+    // while the products' small blocks still fit beside one; 3 rows, two blocks an SM, so the 3 x 8 x 8 blocks take one wave
+    static size_t smem_of[kOptInDevices] = {};   // per device, as above
+    const int dev = opt_in_device();
+    size_t& smem = smem_of[dev];
     if (!smem) {
-        int dev = 0, per_sm = 0, reserved = 0;
-        cudaGetDevice(&dev);
+        int per_sm = 0, reserved = 0;
         cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
         cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
-        smem = std::max(sizeof(FusedSmem), (size_t) std::max(0, per_sm / 2 - reserved + 128));
-        cudaFuncSetAttribute(attn_fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(attn_fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        smem = std::max(sizeof(FusedSmem<2>), (size_t) std::max(0, per_sm / 2 - reserved + 128));
+        cudaFuncSetAttribute(attn_fused_kernel<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
-    if (a.fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), smem, s, pa, a);
-    else bk::launch_pdl(attn_fused_kernel<false>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    if (rows <= 2) {
+        if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    } else {
+        if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+    }
     check("attention_window");
 }
 
