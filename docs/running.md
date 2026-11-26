@@ -48,6 +48,10 @@ Each request ends with one `done` line:
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
+### Request timing fields
+
+The API's `timings` object and the matching `done`-line values are request-level wall-clock totals, not single-window CUDA timings. `prompt_ms` covers prompt reading; `decode_ms` covers decoding after prompt setup, including host time and gaps between decode windows or engine passes that belong to the request. A request that moves between solo and batch execution accumulates the applicable parts, so compare these fields with other request-level measurements. Use the engine log or `basalt-bench` window metrics when you need a per-window or kernel-oriented rate.
+
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
 taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
 next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
@@ -57,7 +61,15 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`. The top of the page always shows:
+The server's address serves a page. Its figures arrive as one combined snapshot over `/api/state/stream`, once per
+second and on observed request, queue or model state changes (checked every 100 ms); a shared publisher serves all
+clients without per-client snapshot queues, and reconnecting clients receive its latest snapshot. This is a combined
+view, not a transaction across all engine and router state; `/metrics`, `/slots` and `/api/logs` remain JSON endpoints
+for external clients. Each SSE endpoint permits up to eight concurrent clients. The Logs tab receives live console
+lines from `/api/logs/stream`, reconnects from its last cursor, and reports server restarts or lines lost from the
+bounded buffer. Both log endpoints require the API key when one is configured; the page sends it in the Authorization
+header. The top of the page always shows:
+
 
 - Decode and prefill: the live rate with a 60 s chart; when idle, the last request's decode and the last prompt read of at least 512
   new tokens (a cached follow-up has no meaningful read rate). The decode number's tooltip has the best decode and the conversation
@@ -89,12 +101,13 @@ The engine's own figures, which the server asks for with `STATS` once the engine
   for its current or last request `accept_pos` (drafts accepted over offered by draft position) and `accept_hist` (tokens per
   decode window, a sample a second over 60 s); for a model with routed experts `hit`: its windows' lookups split `vram`, `peer`
   (a bus copy or another card) and `cpu`, with `lookups_s`, `peer_s` and `ram_s` a second. A batch window several slots share
-  counts its lookups for each of them; a model whose slots run through layer split stages counts none per slot.
+  counts its lookups for each of them; a model whose slots run through the stages of `gpu-mode split` counts none per slot.
 - `/metrics` `engine`: `commit` (the build's), and `expert_slots`, the experts every card holds now (fewer while asleep).
 - `/metrics` `hardware`: each card's `sm_clock` and `mem_clock` (MHz), `throttle` (what holds the clocks down, empty for nothing),
   `expert_slots` and `h2d_gbps` (the host-to-device link as the start measured it; Flash-Next measures it, the other models
   leave it out); `cpu_ccd` (the load of each group of cores that share an L3 cache), `ram_parts` (`experts` the engine holds in
   RAM, `page_cache`, `other`; Linux only) and `disk_hist` (the read rate's last 60 s).
+- **Prometheus:** `GET /metrics` returns Prometheus text exposition format (`text/plain; version=0.0.4`) when `Accept` asks for `text/plain` or `application/openmetrics-text`, or with `?format=prometheus` (JSON otherwise, so the stats page is unchanged). Every metric is named `basalt_*` (requests, tokens, latency histograms, draft acceptance, engine state, GPU and RAM); a dashboard made for another engine's names can use Prometheus relabeling.
 
 The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs. The conversation cache
 figures come from the engine's `conversation cache:` lines and clear when the engine unloads, sleeps or restarts; a model that prints
@@ -113,13 +126,16 @@ After the given seconds without requests, the engine frees its VRAM (the driver 
 RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
+With several models, [`--model-cache-mib`](configuration/models.md#parking-models-in-ram) keeps a model the router switches away from asleep in RAM in the same way, so its next turn wakes it instead of loading it.
+
 ## Lending VRAM: `POST /v1/vram`
 
 With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the expert cache to keep N MiB free (`null`: the start's reserve).
 A resize needs a gap between requests. Idle, it applies at once and answers `200` with the new figures. While a request runs it is
 queued and answered `202 {"status": "pending"}`: it applies when the running requests have finished, and requests that arrive meanwhile
 wait for it, so steady traffic cannot hold it off. A later POST replaces a queued one (`"replaced": true`). A malformed body is a
-`400`. `GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
+`400`. While the model sleeps, the reserve is kept and applied at the wake (`200 {"status": "asleep"}`), as when it is not loaded.
+`GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
 the queued one).
 
 ## Memory floors
@@ -141,6 +157,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
   repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
+- The automatic RAM copy leaves the adaptive swaps' free places room beside the experts, so they need no setting of
+  their own. An explicit `--resident-budget-gib` within the places' own size of the RAM room gives back the coldest
+  experts for them: an evicted expert with nowhere to go is not evicted at all, and the tier moves nothing.
 
 ## Vision: `--vision`
 
