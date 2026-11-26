@@ -6,7 +6,7 @@ A fork of [Basalt](https://github.com/jesdga95/basalt) tuned for one machine: an
 
 The branch `basalt-u7265k-rtx5080` is a short stack of commits with upstream `main` merged in; `fork/update.sh` merges
 upstream, rebuilds, runs the parity tests and only then deploys, so upstream's work keeps flowing in.  Upstream was
-last merged at 0.5.0 (2026-11-19); the new Hy4-flash model brings a DFly2 drafter, but Flash-Next keeps MTP.
+last merged at 0.5.7 + 136 commits (2026-11-27, see fork/LEDGER.md); the new Hy4-flash model brings a DFly2 drafter, but Flash-Next keeps MTP.
 
 Every change below either leaves the output **bit for bit** what upstream computes (checked by the tests named), or is
 off unless switched on.  One exception is marked: where experts are placed, which moves replies the way upstream's own

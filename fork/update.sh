@@ -29,7 +29,7 @@ if [ $FETCH = 1 ]; then
 fi
 
 # upstream builds test targets only with BUILD_TESTING (#370); the parity tests below need them
-cmake -S . -B build -DBUILD_TESTING=ON >/dev/null
+cmake -S . -B build -DBUILD_TESTING=ON -DBASALT_MODELS=all >/dev/null
 cmake --build build --target basalt basalt-bench basalt-probe basalt-vision kq_vnni_test q50_vnni_test pool_tasks_test native_expert_parity dec_moe_parity -j "$(nproc)"
 
 echo "== parity"
