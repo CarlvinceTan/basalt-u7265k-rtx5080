@@ -210,7 +210,7 @@ uint8_t* alloc_ram(uint64_t bytes) {
     // GiB) are far past the caches, so the walks go to DRAM beside the expert reads.  Opt-in, BASALT_THP=1: on a 265K with
     // DDR5-6000 the pool streamed no faster with them, and the load took up to four times longer (compaction).
     static const bool thp = [] { const char* e = std::getenv("BASALT_THP"); return e && e[0] == '1'; }();
-    if (p != nullptr && thp) madvise(p, (size_t) ram_padded(bytes), MADV_HUGEPAGE);
+    if (p != nullptr && thp) platform::advise_hugepages(p, (size_t) ram_padded(bytes));
 #endif
     return p;
 }
