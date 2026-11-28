@@ -1,5 +1,30 @@
 # Fork ledger
 
+## 2026-11-28: upstream main (+150 commits: Gemma 4, ERNIE-5.5-Flash), NVFP4-DQ8 pack
+
+Merge `9c5a7c26` (`merge-main-trial` -> `upgrade-0.5.7`). Machine: Core Ultra 7 265K, 2x48 GB DDR5-6000, RTX 5080 (360 W), CUDA 13.0, driver 580.159.04.
+Pack and flags as in the 2026-11-27 entry. Two conflicts, both where upstream rewrote a file the fork also owns:
+
+- `CMakeLists.txt`: upstream's `mxfp4_avx2*.cpp` and `nvfp4_avx2_dpbusd.cpp` added beside the fork's VNNI flags on `kq_avx2.cpp` (upstream had lowered that file to plain AVX2; the fork's multi-token rows need VNNI).
+- `src/core/ram_load.cpp`: #834 asks for huge pages on every RAM allocation; the fork keeps its `BASALT_THP` gate around the same `advise_hugepages` helper. The gate is what holds up: plain upstream took 9.4 min to load the pack, the fork and the merge 3.5 (load row below), because compaction has to be waited out.
+
+A/B (`basalt-bench -r 3 -p 8k,64k,250k -t conv,struct,prose --seed 7`), order cur/up/up/cur then merge/merge, one fresh engine per arm, medians of the warm repetitions (2 and 3), n=4 per arm:
+
+| Metric | Fork `3a21685a` | Upstream `e284ecf9` | Merge `9c5a7c26` |
+| --- | --- | --- | --- |
+| prefill 8K (engine tok/s) | 4764 | 4775 | 4771 |
+| prefill 64K | 5723 | 5711 | 5705 |
+| prefill 250K | 5328 | 5316 | 5314 |
+| decode C=1 struct (acc 98%) | 183.4 | 181.6 | 184.7 |
+| decode C=1 conv (acc 68-71%) | 118.6 | 120.4 | 118.3 |
+| decode C=1 prose (acc 68-70%) | 113.7 | 118.3 | 114.1 |
+| model load (wall, expert fault-in) | ~3.5 min | ~9.4 min | ~3.5 min |
+
+Nothing in the 150 commits touches this pack: the new AVX-VNNI NVFP4 rung (#688) is for CPUs without AVX-VNNI-INT8, and the MXFP4/MXFP8 rows are other formats. Prefill is within 0.2% across the three arms; decode struct, the only tight decode column (sd ~1%), puts the fork and the merge about 1% over plain upstream. Conv and prose swing ±10% between repetitions in every arm, so those columns carry no signal. The merge is neutral on speed and is taken for Gemma 4 / ERNIE-5.5-Flash and the kernel correctness fixes (#789, Q8_1/Q8_K edge cases), not for tok/s.
+
+Service: `fork/update.sh --no-fetch --deploy` rebuilt it (all models), `kq_vnni_test` 1431/0, `q50_vnni_test` 1152/0, `pool_tasks_test` 90/0; GPU parity skipped because the live service held the card. Chat verified on :11001 after the restart (thinking off, and `BASALT_ANY_MODEL=1` answering a client's model name), load 3.5 min, no config changes.
+Raw results: `~/bench/basalt-0.5.7/ab3-{cur,up,merge}-{0,1}/` (`result.json` per arm).
+
 ## 2026-11-27: upstream 0.5.5 -> main (v0.5.7 + 136 commits), NVFP4-DQ8 pack
 
 Merge `3a21685a` (branch `upgrade-0.5.7` -> `basalt-u7265k-rtx5080`). Machine: Core Ultra 7 265K, 2x48 GB DDR5-6000, RTX 5080 (360 W), CUDA 13.0, driver 580.159.04.
